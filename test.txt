@@ -138,3 +138,100 @@ ps_custom_script_url: "https://jfrog.example.com/artifactory/scripts/install-psm
   systemd:
     name: tentacle
     state: restarted
+
+
+
+---
+- name: Ensure parent dir for Terraform config exists
+  file:
+    path: "{{ terraform_config_path | dirname }}"
+    state: directory
+    mode: '0755'
+
+- name: Install Terraform registry mirror config (system-wide)
+  template:
+    src: terraformrc.j2
+    dest: "{{ terraform_config_path }}"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Validate terraform binary present (optional)
+  command: terraform version
+  register: tf_ver
+  changed_when: false
+  failed_when: false
+
+
+
+# Managed by Ansible
+provider_installation {
+  network_mirror {
+    url    = "{{ terraform_jfrog_mirror_url }}"
+    include = ["*/*"]
+  }
+  direct {
+    {% if terraform_jfrog_skip_tls_verify %}
+    # NOTE: If using internal CA, consider putting CA in /etc/pki/ca-trust (RHEL) and don't skip verify.
+    {% endif %}
+  }
+}
+
+
+
+---
+- name: Install Microsoft repo (RHEL/Fedora family)
+  when: ansible_facts['os_family'] == 'RedHat'
+  get_url:
+    url: https://packages.microsoft.com/config/rhel/{{ ansible_facts['distribution_major_version'] }}/packages-microsoft-prod.rpm
+    dest: /tmp/packages-microsoft-prod.rpm
+
+- name: Register Microsoft repo (RHEL/Fedora)
+  when: ansible_facts['os_family'] == 'RedHat'
+  yum:
+    name: /tmp/packages-microsoft-prod.rpm
+    state: present
+
+- name: Install PowerShell
+  when: install_powershell | bool
+  package:
+    name: powershell
+    state: present
+
+- name: Ensure module paths exist (system-wide and for octopus user)
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+  loop:
+    - /usr/local/share/powershell/Modules
+    - "{{ octopus_home }}/.local/share/powershell/Modules"
+
+- name: Install standard modules system-wide
+  shell: |
+    pwsh -NoLogo -NoProfile -Command "Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted; Install-Module -Name {{ item.name }} {{ '--RequiredVersion ' ~ item.version if item.version is match('^\\d') else '' }} -Scope AllUsers -Force"
+  args:
+    creates: "/usr/local/share/powershell/Modules/{{ item.name }}"
+  loop: "{{ ps_modules_systemwide | default([]) }}"
+
+- name: Run custom module bootstrap script (optional)
+  when: ps_custom_script_url is defined and ps_custom_script_url|length > 0
+  block:
+    - name: Download custom PS script
+      get_url:
+        url: "{{ ps_custom_script_url }}"
+        dest: /tmp/install-psmodules.ps1
+        mode: '0644'
+    - name: Execute custom PS script as octopus user
+      become_user: "{{ octopus_user }}"
+      shell: pwsh -NoLogo -NoProfile -File /tmp/install-psmodules.ps1
+
+- name: Make modules visible to octopus user
+  file:
+    path: "{{ octopus_home }}/.local/share/powershell/Modules"
+    owner: "{{ octopus_user }}"
+    group: "{{ octopus_group }}"
+    recurse: yes
+
