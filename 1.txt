@@ -1,0 +1,204 @@
+# types.py (or put in transformer.py)
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Tuple, Optional
+import re
+
+# Parse a variety of date/time formats you may see from Splunk/Jira
+_DT_FORMATS: List[str] = [
+    "%a %b %d %H:%M:%S %Z %Y",    # Mon Oct 13 07:00:00 UTC 2025
+    "%a %b %d %H:%M:%S GMT %Y",   # Mon Oct 13 07:00:00 GMT 2025
+    "%Y-%m-%dT%H:%M:%S.%f%z",     # 2025-10-13T07:00:00.000-05:00
+    "%Y-%m-%dT%H:%M:%S%z",        # 2025-10-13T07:00:00-05:00
+    "%Y-%m-%d %H:%M:%S",          # 2025-10-13 07:00:00
+    "%Y-%m-%d",                   # 2025-10-13
+]
+
+def parse_dt(v: Any) -> Optional[datetime]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+
+    # normalize common tokens
+    s = s.replace("Z", "+00:00").replace("GMT", "UTC")
+
+    # allow "Mon Oct  3" (single-digit day) by collapsing spaces
+    s = re.sub(r"\s{2,}", " ", s)
+
+    for fmt in _DT_FORMATS:
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None  # couldn't parse
+
+def parse_bool(v: Any) -> Optional[bool]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("true","t","1","yes","y"): return True
+    if s in ("false","f","0","no","n"): return False
+    return None
+
+def parse_float(v: Any) -> Optional[float]:
+    if v in (None, "", "null", "None"):
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+def parse_int(v: Any) -> Optional[int]:
+    if v in (None, "", "null", "None"):
+        return None
+    try:
+        return int(v)
+    except Exception:
+        # sometimes arrives as float-like string "3.0"
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+
+# Map a SQL type (from your schema) to a coercer
+def _coercer_for_sql_type(sql_type: str):
+    t = sql_type.upper()
+    if t.startswith("DATETIME") or t.startswith("DATE") or t.startswith("SMALLDATETIME"):
+        return parse_dt
+    if t.startswith("BIT"):
+        return parse_bool
+    if t.startswith("FLOAT") or t.startswith("REAL") or t.startswith("DECIMAL") or t.startswith("NUMERIC"):
+        return parse_float
+    if t.startswith("INT") or t.startswith("BIGINT") or t.startswith("SMALLINT") or t.startswith("TINYINT"):
+        return parse_int
+    # NVARCHAR, VARCHAR, NCHAR, TEXT, etc. → stringify
+    return lambda v: None if v is None else str(v)
+
+def coerce_row_to_schema(row: Dict[str, Any], schema: List[Tuple[str, str]]) -> Dict[str, Any]:
+    """
+    Given a dict (row) and a schema like [("EventDate","DATETIME2(3)"), ("Issue","NVARCHAR(200)")]
+    return a new dict with columns coerced to the appropriate Python types.
+    Missing columns become None; extra keys are dropped.
+    """
+    coerced: Dict[str, Any] = {}
+    for col_name, sql_type in schema:
+        coercer = _coercer_for_sql_type(sql_type)
+        coerced[col_name] = coercer(row.get(col_name))
+    return coerced
+
+
+
+# etl.py
+from db import Database
+from types import coerce_row_to_schema  # adjust import if you placed it elsewhere
+
+# ... inside JiraSplunkETL.run()
+
+coerced_assign_rows = [
+    coerce_row_to_schema(arow, Database.ASSIGN_COLS)
+    for arow in assign_rows
+]
+self.db.merge_assign_rows(coerced_assign_rows)
+
+
+
+
+from typing import Any, Dict, List, Optional
+import re
+from datetime import datetime
+
+# reuse your existing date parser if you have one
+def _parse_dt(s: Any) -> Optional[datetime]:
+    if s is None: return None
+    txt = str(s).strip().replace("GMT", "UTC").replace("Z", "+00:00")
+    txt = re.sub(r"\s{2,}", " ", txt)
+    for fmt in ("%a %b %d %H:%M:%S %Z %Y", "%Y-%m-%dT%H:%M:%S.%f%z",
+                "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(txt, fmt)
+        except Exception:
+            pass
+    return None
+
+def _to_list(v: Any) -> List[str]:
+    if v is None: return []
+    if isinstance(v, (list, tuple)):
+        return [str(x).strip() for x in v if str(x).strip()]
+    s = str(v).strip()
+    if not s: return []
+    # simple comma split
+    return [p.strip() for p in s.split(",") if p.strip()]
+
+def explode_assignments_cross(payload: Dict[str, Any], meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Build ALL combinations of (SprintName x EventDate) for a single issue record.
+    - sprint name can be list or comma-separated string
+    - event dates can be list, single string, or taken from meta['_time']
+    """
+    issue   = (payload.get("issue")   or {}).get("key")
+    project = (payload.get("project") or {}).get("name")
+
+    # sprints (list or comma-separated string)
+    raw_sprint = (payload.get("sprint") or {}).get("name")
+    sprints = _to_list(raw_sprint)
+
+    # event dates: accept list or single; fallback to meta _time (single)
+    raw_dates = payload.get("eventDates")
+    if raw_dates is None:
+        raw_dates = payload.get("eventDate")
+    dates = _to_list(raw_dates)
+    if not dates:
+        meta_dt = _parse_dt(meta.get("_time"))
+        dates = [meta_dt] if meta_dt else [None]
+    else:
+        dates = [_parse_dt(d) for d in dates]
+
+    # If there are no sprints at all, still emit one row with empty sprint
+    if not sprints:
+        sprints = [""]
+
+    rows: List[Dict[str, Any]] = []
+    for sn in sprints:
+        for ed in dates:
+            rows.append({
+                "Issue": issue,
+                "ProjectName": project,
+                "SprintName": sn,
+                "EventDate": ed,
+            })
+
+    # de-dupe just in case
+    seen = set()
+    uniq = []
+    for r in rows:
+        k = (r["Issue"], r["ProjectName"], r["SprintName"], r["EventDate"])
+        if k in seen: 
+            continue
+        seen.add(k)
+        uniq.append(r)
+    return uniq
+
+
+
+# etl.py
+from transformer import explode_assignments_cross
+from types import coerce_row_to_schema  # your coercer
+from db import Database
+
+assign_rows = []
+for rec in raw_rows:
+    payload = parse_raw_json(rec)
+    if not payload:
+        continue
+    assign_rows.extend(explode_assignments_cross(payload, rec))
+
+# coerce to table schema (handles datetime, bool, etc.)
+assign_rows = [coerce_row_to_schema(r, Database.ASSIGN_COLS) for r in assign_rows]
+
+# upsert/insert
+self.db.merge_assign_rows(assign_rows)
+    
+    
