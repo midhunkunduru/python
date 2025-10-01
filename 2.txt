@@ -1,0 +1,94 @@
+def merge_sprint_rows(self, rows: List[Dict[str, Any]]):
+    """Upsert into dbo.jira_sprint using MERGE + VALUES (no table variables)."""
+    if not rows:
+        return
+
+    self._create_table_if_not_exists(self.TABLE_SPRINT, self.SPRINT_COLS, self.SPRINT_PK)
+    cn = self.connect()
+    cur = cn.cursor()
+
+    cols = [c for c, _ in self.SPRINT_COLS]
+    pk_cols = ("ProjectName", "SprintName")
+    src_cols = ", ".join(f"[{c}]" for c in cols)
+    tgt_cols = src_cols
+    assignments = ", ".join([f"T.[{c}] = S.[{c}]" for c in cols if c not in pk_cols])
+
+    # 2100 parameter ceiling
+    per_row_params = len(cols)
+    max_rows = max(1, 2000 // per_row_params)
+
+    def to_params(batch):
+        for r in batch:
+            for c in cols:
+                yield r.get(c)
+
+    i = 0
+    n = len(rows)
+    while i < n:
+        batch = rows[i:i + max_rows]
+        i += len(batch)
+
+        row_placeholders = "(" + ", ".join(["?"] * per_row_params) + ")"
+        values_clause = ", ".join([row_placeholders] * len(batch))
+
+        merge_sql = f"""
+MERGE {self.TABLE_SPRINT} AS T
+USING (VALUES {values_clause}) AS S ({src_cols})
+  ON T.[ProjectName]=S.[ProjectName] AND T.[SprintName]=S.[SprintName]
+WHEN MATCHED THEN UPDATE SET {assignments}
+WHEN NOT MATCHED THEN INSERT ({tgt_cols}) VALUES ({src_cols});
+"""
+        params = list(to_params(batch))
+        cur.execute(merge_sql, params)
+
+    cur.close()
+
+
+    def merge_assign_rows(self, rows: List[Dict[str, Any]]):
+    """
+    Idempotent insert for dbo.jira_sprint_issue_assigned.
+    We only INSERT when a (Issue, ProjectName, SprintName, EventDate) combo doesn't exist.
+    No updates (it's an event log).
+    """
+    if not rows:
+        return
+
+    self._create_table_if_not_exists(self.TABLE_ASSIGN, self.ASSIGN_COLS, self.ASSIGN_PK)
+    cn = self.connect()
+    cur = cn.cursor()
+
+    cols = [c for c, _ in self.ASSIGN_COLS]
+    src_cols = ", ".join(f"[{c}]" for c in cols)
+    tgt_cols = src_cols
+
+    per_row_params = len(cols)
+    max_rows = max(1, 2000 // per_row_params)
+
+    def to_params(batch):
+        for r in batch:
+            for c in cols:
+                yield r.get(c)
+
+    i = 0
+    n = len(rows)
+    while i < n:
+        batch = rows[i:i + max_rows]
+        i += len(batch)
+
+        row_placeholders = "(" + ", ".join(["?"] * per_row_params) + ")"
+        values_clause = ", ".join([row_placeholders] * len(batch))
+
+        merge_sql = f"""
+MERGE {self.TABLE_ASSIGN} AS T
+USING (VALUES {values_clause}) AS S ({src_cols})
+  ON  T.[Issue]=S.[Issue]
+  AND T.[ProjectName]=S.[ProjectName]
+  AND T.[SprintName]=S.[SprintName]
+  AND T.[EventDate]=S.[EventDate]
+WHEN NOT MATCHED THEN
+  INSERT ({tgt_cols}) VALUES ({src_cols});
+"""
+        params = list(to_params(batch))
+        cur.execute(merge_sql, params)
+
+    cur.close()
