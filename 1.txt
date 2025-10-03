@@ -1,0 +1,86 @@
+from datetime import datetime, timezone
+import re
+
+def parse_dt(v):
+    """
+    Convert Splunk time fields (e.g. '2025-10-03T07:10:30.000-05:00') to a naive UTC datetime.
+    Supports epoch, ISO-8601 with or without ms & offset, and common Splunk formats.
+    Returns None if it cannot parse.
+    """
+    if v is None:
+        return None
+
+    # If already datetime
+    if isinstance(v, datetime):
+        # normalize to UTC naive
+        if v.tzinfo:
+            return v.astimezone(timezone.utc).replace(tzinfo=None)
+        return v
+
+    s = str(v).strip()
+
+    # Epoch check
+    if re.fullmatch(r"\d+(\.\d+)?", s):
+        try:
+            return datetime.fromtimestamp(float(s), tz=timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return None
+
+    # Normalize some timezone words
+    s = s.replace("GMT", "UTC").replace("Z", "+00:00")
+    # Collapse double spaces
+    s = re.sub(r"\s{2,}", " ", s)
+
+    fmts = [
+        "%Y-%m-%dT%H:%M:%S.%f%z",  # 2025-10-03T07:10:30.000-05:00
+        "%Y-%m-%dT%H:%M:%S%z",     # 2025-10-03T07:10:30-05:00
+        "%Y-%m-%d %H:%M:%S",
+        "%a %b %d %H:%M:%S %Z %Y", # Mon Oct 13 07:00:00 UTC 2025
+    ]
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
+        except Exception:
+            continue
+    return None
+
+
+
+from typing import Any, Dict, List
+from .types import parse_dt
+
+def _to_list(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return [p.strip() for p in str(v).split(",") if p.strip()]
+
+def explode_assignments_cross_from_meta_time(payload: Dict[str, Any], meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Build one row per SprintName, using Splunk _time as EventDate.
+    """
+    issue   = (payload.get("issue")   or {}).get("key")
+    project = (payload.get("project") or {}).get("name")
+    raw     = (payload.get("sprint")  or {}).get("name")
+    sprints = _to_list(raw)
+    if not sprints:
+        sprints = [""]
+
+    event_dt = parse_dt(meta.get("_time"))  # <-- handle ISO-8601 with offset
+    rows = []
+    for sn in sprints:
+        rows.append({
+            "Issue": issue,
+            "ProjectName": project,
+            "SprintName": sn,
+            "EventDate": event_dt
+        })
+    return rows
+
+
+    
+    
