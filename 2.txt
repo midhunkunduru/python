@@ -1,0 +1,162 @@
+---
+- name: Install/upgrade Checkov from JFrog
+  hosts: all
+  become: true
+  gather_facts: yes
+
+  vars:
+    # === Required: set these via --extra-vars or inventory/group_vars ===
+    checkov_version: "3.2.0"     # desired version
+    jfrog_base_url: "https://yourcompany.jfrog.io/artifactory"
+    jfrog_repo_path: "generic-local/checkov"   # path holding the tar.gz
+    # If your artifact is named differently, adjust the filename template:
+    jfrog_filename: "checkov-{{ checkov_version }}.tar.gz"
+
+    # Auth options: pick one (API key header OR basic auth)
+    jfrog_api_key: "{{ lookup('env', 'JFROG_API_KEY') | default('', true) }}"
+    jfrog_username: "{{ lookup('env', 'JFROG_USERNAME') | default('', true) }}"
+    jfrog_password: "{{ lookup('env', 'JFROG_PASSWORD') | default('', true) }}"
+
+    # Optional: provide a checksum (sha256:...) to verify the tarball
+    # artifact_checksum: "sha256:xxxxxxxx..."
+
+    # Internals
+    download_dir: "/tmp/checkov_install"
+    download_path: "{{ download_dir }}/{{ jfrog_filename }}"
+    download_url: "{{ jfrog_base_url.rstrip('/') }}/{{ jfrog_repo_path.strip('/') }}/{{ jfrog_filename }}"
+    pip_executable: >-
+      {{ (ansible_facts.packages is defined and ('python3-pip' in ansible_facts.packages or 'python-pip' in ansible_facts.packages))
+          | ternary('pip3', 'pip3') }}
+    # Some distros name the bin differently; we'll create a shim later.
+    checkov_bin_candidates:
+      - /usr/local/bin/checkov
+      - /usr/bin/checkov
+
+  pre_tasks:
+    - name: Ensure Python + pip are present (Debian/Ubuntu)
+      apt:
+        name:
+          - python3
+          - python3-pip
+        state: present
+        update_cache: yes
+      when: ansible_facts.os_family == "Debian"
+
+    - name: Ensure Python + pip are present (RHEL/CentOS/Alma/Rocky/Amazon)
+      package:
+        name:
+          - python3
+          - python3-pip
+        state: present
+      when: ansible_facts.os_family in ["RedHat", "Rocky", "AlmaLinux", "Amazon"]
+
+    - name: Create temp download directory
+      file:
+        path: "{{ download_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Detect installed Checkov version (if any)
+      shell: |
+        set -o pipefail
+        if command -v checkov >/dev/null 2>&1; then
+          checkov --version 2>/dev/null | sed -E 's/^[Vv]?(Checkov)?[[:space:]]*[Vv]?(ersion)?[[:space:]]*//'
+        else
+          echo "NOT_INSTALLED"
+        fi
+      args:
+        executable: /bin/bash
+      register: checkov_ver_cmd
+      changed_when: false
+
+    - name: Normalize installed version fact
+      set_fact:
+        checkov_installed_version: "{{ (checkov_ver_cmd.stdout | trim) if (checkov_ver_cmd.stdout | trim) != 'NOT_INSTALLED' else None }}"
+
+    - name: Decide if install/upgrade is needed
+      set_fact:
+        need_install: "{{ (checkov_installed_version is not defined) or (checkov_installed_version is none) or (checkov_installed_version != checkov_version) }}"
+
+  tasks:
+    - name: Show current/desired versions
+      debug:
+        msg:
+          - "Installed: {{ checkov_installed_version | default('none') }}"
+          - "Desired:   {{ checkov_version }}"
+          - "Need install/upgrade: {{ need_install }}"
+
+    - name: Build JFrog headers fact (API key if provided)
+      set_fact:
+        jfrog_headers: >-
+          {{
+            (jfrog_api_key | length > 0)
+            | ternary({'X-JFrog-Art-Api': jfrog_api_key}, {})
+          }}
+
+    - name: Check artifact exists in JFrog (HEAD)
+      uri:
+        url: "{{ download_url }}"
+        method: HEAD
+        headers: "{{ jfrog_headers }}"
+        url_username: "{{ (jfrog_headers | length == 0 and jfrog_username | length > 0) | ternary(jfrog_username, omit) }}"
+        url_password: "{{ (jfrog_headers | length == 0 and jfrog_password | length > 0) | ternary(jfrog_password, omit) }}"
+        force_basic_auth: yes
+        status_code: [200]
+        return_content: no
+        validate_certs: yes
+      register: head_result
+      failed_when: head_result.status not in [200]
+      when: need_install
+
+    - name: Download Checkov tarball from JFrog
+      get_url:
+        url: "{{ download_url }}"
+        dest: "{{ download_path }}"
+        mode: "0644"
+        headers: "{{ jfrog_headers }}"
+        url_username: "{{ (jfrog_headers | length == 0 and jfrog_username | length > 0) | ternary(jfrog_username, omit) }}"
+        url_password: "{{ (jfrog_headers | length == 0 and jfrog_password | length > 0) | ternary(jfrog_password, omit) }}"
+        force_basic_auth: yes
+        checksum: "{{ artifact_checksum | default(omit) }}"
+        validate_certs: yes
+      when: need_install
+
+    - name: Install Checkov from downloaded tarball using pip
+      pip:
+        name: "{{ download_path }}"
+        executable: "{{ pip_executable }}"
+        extra_args: "--no-deps"
+        state: present
+      when: need_install
+
+    - name: Ensure /usr/local/bin/checkov shim exists and resolves
+      copy:
+        dest: /usr/local/bin/checkov
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          exec python3 -m checkov "$@"
+      when: need_install or (checkov_bin_candidates | map('file') | list | select('equalto', True) | length == 0)
+
+    - name: Re-check installed Checkov version
+      shell: |
+        set -o pipefail
+        checkov --version 2>/dev/null | sed -E 's/^[Vv]?(Checkov)?[[:space:]]*[Vv]?(ersion)?[[:space:]]*//'
+      args:
+        executable: /bin/bash
+      register: checkov_ver_after
+      changed_when: false
+
+    - name: Assert desired version is installed
+      assert:
+        that:
+          - checkov_ver_after.stdout | trim == checkov_version
+        fail_msg: "Checkov {{ checkov_version }} did not install as expected. Got {{ checkov_ver_after.stdout | trim }}."
+        success_msg: "Checkov {{ checkov_version }} is installed."
+
+  post_tasks:
+    - name: Clean up download (optional)
+      file:
+        path: "{{ download_path }}"
+        state: absent
+      when: need_install
