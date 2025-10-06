@@ -1,0 +1,310 @@
+#!/usr/bin/env python
+"""
+Full-field validation for Splunk JSON (sprints/issues/assignments) with:
+- per-field rules (required, regex, max length, enums, datetime/bool/number)
+- cross-field checks (e.g., SprintStartDate <= SprintEndDate)
+- quarantine of invalid rows to JSONL with reasons
+- type coercion to DB schema and safe load
+
+Run locally:
+  python validate_and_load_all.py
+"""
+
+from __future__ import annotations
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# ---- your existing modules ----
+from jira_splunk_etl.settings import SplunkConfig, AzureSQLConfig
+from jira_splunk_etl.splunk_source import SplunkSource
+from jira_splunk_etl.transformer import (
+    parse_raw_json,
+    explode_sprints,                              # we’ll call with meta to add EventDate if you’ve wired it
+    build_issue_row,
+    explode_assignments_cross_from_meta_time,     # EventDate <- _time
+)
+from jira_splunk_etl.types import (
+    parse_dt, parse_bool, parse_float, parse_int,
+    coerce_row_to_schema,
+)
+from jira_splunk_etl.db import Database
+
+
+# ============================================================
+# Validation primitives
+# ============================================================
+
+@dataclass
+class FieldRule:
+    name: str
+    required: bool = False
+    normalize: Optional[Callable[[Any], Any]] = None   # transform before check
+    check: Optional[Callable[[Any], bool]] = None      # returns True/False
+    message: Optional[str] = None
+
+def is_not_null(v: Any) -> bool:
+    return v is not None and str(v).strip() != ""
+
+ALNUM_SOFT = re.compile(r"^[A-Za-z0-9 ._\-:/()\[\],]+$")  # tweak allowed punctuation here
+
+def is_alnum_soft(v: Any) -> bool:
+    if v is None: return False
+    return bool(ALNUM_SOFT.match(str(v).strip()))
+
+def max_len(n: int) -> Callable[[Any], bool]:
+    def _check(v: Any) -> bool:
+        return v is None or len(str(v)) <= n
+    return _check
+
+def one_of(options: List[str]) -> Callable[[Any], bool]:
+    opts = {o.lower(): True for o in options}
+    def _check(v: Any) -> bool:
+        if v is None: return False
+        return str(v).lower() in opts
+    return _check
+
+def is_datetime(v: Any) -> bool:
+    return parse_dt(v) is not None
+
+def to_trim(v: Any) -> Any:
+    if v is None: return None
+    return str(v).strip()
+
+def to_dt(v: Any) -> Any:
+    """Normalize to datetime (UTC-naive) or leave value (so check fails)"""
+    dt = parse_dt(v)
+    return dt if dt is not None else v
+
+def to_bool(v: Any) -> Any:
+    b = parse_bool(v)
+    return b if b is not None else v
+
+def to_float(v: Any) -> Any:
+    f = parse_float(v)
+    return f if f is not None else v
+
+def to_int(v: Any) -> Any:
+    i = parse_int(v)
+    return i if i is not None else v
+
+def validate_row(row: Dict[str, Any], rules: List[FieldRule]) -> Tuple[bool, Dict[str, str], Dict[str, Any]]:
+    """Apply per-field rules; return (ok, errors_by_field, normalized_row)."""
+    out = dict(row)
+    errs: Dict[str, str] = {}
+    for r in rules:
+        val = out.get(r.name)
+        # normalize
+        if r.normalize:
+            try:
+                val = r.normalize(val)
+                out[r.name] = val
+            except Exception:
+                errs[r.name] = r.message or f"{r.name} normalization failed"
+                continue
+        # required
+        if r.required and not is_not_null(val):
+            errs[r.name] = r.message or f"{r.name} is required"
+            continue
+        # check
+        if r.check and is_not_null(val):
+            try:
+                ok = r.check(val)
+            except Exception:
+                ok = False
+            if not ok:
+                errs[r.name] = r.message or f"{r.name} failed validation"
+    return (len(errs) == 0), errs, out
+
+def write_quarantine(bad: List[Dict[str, Any]], path: str) -> None:
+    if not bad: return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for rec in bad:
+            f.write(json.dumps(rec, default=str) + "\n")
+
+# ============================================================
+# Rule sets (covering ~18 fields)
+# Adjust to exactly match your payload/column names and limits
+# ============================================================
+
+# ---- Sprint fields (10) ----
+SPRINT_RULES: List[FieldRule] = [
+    FieldRule("ProjectName",      required=True,  normalize=to_trim, check=lambda v: is_alnum_soft(v) and max_len(400)(v),
+              message="ProjectName required; alphanumeric/._-:/()[] and <=400 chars"),
+    FieldRule("SprintName",       required=True,  normalize=to_trim, check=lambda v: is_alnum_soft(v) and max_len(400)(v),
+              message="SprintName required; alphanumeric/._-:/()[] and <=400 chars"),
+    FieldRule("SprintBoardId",    required=False, normalize=to_trim, check=max_len(200),
+              message="SprintBoardId must be <=200 chars"),
+    FieldRule("SprintStartDate",  required=False, normalize=to_dt,   check=is_datetime,
+              message="SprintStartDate must be a valid datetime"),
+    FieldRule("SprintEndDate",    required=False, normalize=to_dt,   check=is_datetime,
+              message="SprintEndDate must be a valid datetime"),
+    FieldRule("SprintCompletedDate", required=False, normalize=to_dt, check=is_datetime,
+              message="SprintCompletedDate must be a valid datetime"),
+    FieldRule("SprintIsStarted",  required=False, normalize=to_bool),
+    FieldRule("SprintIsClosed",   required=False, normalize=to_bool),
+    FieldRule("SprintGoal",       required=False, normalize=to_trim, check=max_len(4000)),
+    FieldRule("EventDate",        required=False, normalize=to_dt,   check=is_datetime),
+]
+
+# ---- Issue fields (8+) ----
+ISSUE_RULES: List[FieldRule] = [
+    FieldRule("Issue",              required=True,  normalize=to_trim, check=lambda v: is_alnum_soft(v) and max_len(200)(v),
+              message="Issue key required; alphanumeric/._-:/()[] and <=200 chars"),
+    FieldRule("ProjectName",        required=False, normalize=to_trim, check=max_len(400)),
+    FieldRule("IssueSummary",       required=False, normalize=to_trim, check=max_len(4000)),
+    FieldRule("IssueTypeName",      required=False, normalize=to_trim, check=max_len(200)),
+    FieldRule("IssueAssigneeName",  required=False, normalize=to_trim, check=max_len(400)),
+    FieldRule("IssueParentKey",     required=False, normalize=to_trim, check=max_len(200)),
+    FieldRule("IssueParentSummary", required=False, normalize=to_trim, check=max_len(4000)),
+    FieldRule("IssueStatusName",    required=False, normalize=to_trim, check=max_len(200)),
+    FieldRule("IssueStoryPoints",   required=False, normalize=to_float),
+]
+
+# ---- Assignment fields (4) ----
+ASSIGN_RULES: List[FieldRule] = [
+    FieldRule("Issue",       required=True,  normalize=to_trim, check=lambda v: is_alnum_soft(v) and max_len(200)(v),
+              message="Issue key required; alphanumeric and <=200"),
+    FieldRule("ProjectName", required=True,  normalize=to_trim, check=lambda v: is_alnum_soft(v) and max_len(400)(v),
+              message="ProjectName required; alphanumeric and <=400"),
+    FieldRule("SprintName",  required=True,  normalize=to_trim, check=lambda v: is_alnum_soft(v) and max_len(400)(v),
+              message="SprintName required; alphanumeric and <=400"),
+    FieldRule("EventDate",   required=True,  normalize=to_dt,   check=is_datetime,
+              message="EventDate required valid datetime"),
+]
+
+# ---- Cross-field checks (per entity) ----
+def sprint_crosschecks(row: Dict[str, Any]) -> Dict[str, str]:
+    errs: Dict[str, str] = {}
+    sd = row.get("SprintStartDate")
+    ed = row.get("SprintEndDate")
+    cd = row.get("SprintCompletedDate")
+    # Only compare if both present
+    if sd and ed and sd > ed:
+        errs["SprintStartDate"] = "SprintStartDate must be <= SprintEndDate"
+    if ed and cd and ed > cd:
+        # Completed should be >= end (if both present); relax if you prefer
+        errs["SprintCompletedDate"] = "SprintCompletedDate should be >= SprintEndDate"
+    return errs
+
+def issue_crosschecks(row: Dict[str, Any]) -> Dict[str, str]:
+    return {}  # no-op for now
+
+def assign_crosschecks(row: Dict[str, Any]) -> Dict[str, str]:
+    return {}  # no-op for now
+
+
+# ============================================================
+# Main validation + load
+# ============================================================
+
+def run_full_validation_and_load(
+    override_query: Optional[str] = None,
+    quarantine_dir: str = "./quarantine",
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, int]:
+    log = logger or logging.getLogger(__name__)
+    os.makedirs(quarantine_dir, exist_ok=True)
+
+    # 1) Fetch raw Splunk rows
+    spl = SplunkSource(SplunkConfig())
+    raw_rows = spl.read_jira_sprint_events(override_query)
+    log.info("Fetched %d raw rows from Splunk", len(raw_rows))
+
+    # 2) Build candidate rows from payload/meta
+    sprint_rows: List[Dict[str, Any]] = []
+    issue_rows:  List[Dict[str, Any]] = []
+    assign_rows: List[Dict[str, Any]] = []
+
+    for rec in raw_rows:
+        payload = parse_raw_json(rec)
+        if not payload:
+            # quarantine “raw parse failed”
+            reason = {"raw": "payload json parse failed"}
+            write_quarantine([{"why": reason, "rec": rec}], os.path.join(quarantine_dir, "invalid_raw.jsonl"))
+            continue
+
+        # Sprints (explode) – include meta for EventDate if your explode_sprints supports it
+        # If your explode_sprints signature is (payload) only, remove `rec` from call.
+        try:
+            sr = explode_sprints(payload, rec)  # or explode_sprints(payload)
+        except TypeError:
+            sr = explode_sprints(payload)
+        sprint_rows.extend(sr)
+
+        # Issues
+        issue_rows.append(build_issue_row(payload))
+
+        # Assignments – EventDate from _time
+        assign_rows.extend(explode_assignments_cross_from_meta_time(payload, rec))
+
+    # 3) Validate per-entity (field rules + cross-field checks)
+    good_sprint, bad_sprint = _validate_entity_list(sprint_rows, SPRINT_RULES, sprint_crosschecks)
+    good_issue,  bad_issue  = _validate_entity_list(issue_rows,  ISSUE_RULES,  issue_crosschecks)
+    good_assign, bad_assign = _validate_entity_list(assign_rows, ASSIGN_RULES, assign_crosschecks)
+
+    # 4) Quarantine bad rows with reasons
+    write_quarantine(bad_sprint, os.path.join(quarantine_dir, "invalid_sprints.jsonl"))
+    write_quarantine(bad_issue,  os.path.join(quarantine_dir, "invalid_issues.jsonl"))
+    write_quarantine(bad_assign, os.path.join(quarantine_dir, "invalid_assignments.jsonl"))
+
+    log.info(
+        "Validation results: sprints ok=%d bad=%d | issues ok=%d bad=%d | assignments ok=%d bad=%d",
+        len(good_sprint), len(bad_sprint), len(good_issue), len(bad_issue), len(good_assign), len(bad_assign)
+    )
+
+    # 5) Coerce to DB column types and load
+    good_sprint = [coerce_row_to_schema(r, Database.SPRINT_COLS) for r in good_sprint]
+    good_issue  = [coerce_row_to_schema(r, Database.ISSUE_COLS)  for r in good_issue]
+    good_assign = [coerce_row_to_schema(r, Database.ASSIGN_COLS) for r in good_assign]
+
+    db = Database(AzureSQLConfig())
+    db.merge_sprint_rows(good_sprint)
+    db.upsert_issues(good_issue)
+    db.merge_assign_rows(good_assign)
+
+    stats = {
+        "sprint_ok": len(good_sprint), "sprint_bad": len(bad_sprint),
+        "issue_ok":  len(good_issue),  "issue_bad":  len(bad_issue),
+        "assign_ok": len(good_assign), "assign_bad": len(bad_assign),
+    }
+    log.info("Load complete: %s", stats)
+    return stats
+
+
+def _validate_entity_list(
+    rows: List[Dict[str, Any]],
+    rules: List[FieldRule],
+    crosscheck: Callable[[Dict[str, Any]], Dict[str, str]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Validate a list of rows for one entity; return (good, bad_with_reasons)."""
+    good: List[Dict[str, Any]] = []
+    bad:  List[Dict[str, Any]] = []
+    for r in rows:
+        ok, errs, out = validate_row(r, rules)
+        # cross-field checks (only run if basic rules didn’t already make it hopeless)
+        if ok:
+            xerrs = crosscheck(out)
+            if xerrs:
+                ok = False
+                errs.update(xerrs)
+        if ok:
+            good.append(out)
+        else:
+            bad.append({"why": errs, "row": r})
+    return good, bad
+
+
+# ------------------------------------------------------------
+# CLI
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
+    )
+    run_full_validation_and_load()
